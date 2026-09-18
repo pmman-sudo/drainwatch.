@@ -1,6 +1,7 @@
 import os
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from math import ceil
 from typing import Literal
 
 from dotenv import load_dotenv
@@ -9,6 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import Boolean, DateTime, Float, Integer, String, create_engine, func, select, update
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
+from .spam import ReportBodyLimit, report_fingerprint
 
 load_dotenv()
 url = os.getenv("DATABASE_URL", "sqlite:///./drainwatch.db")
@@ -18,6 +20,10 @@ engine = create_engine(url, pool_pre_ping=True,
                        connect_args={"check_same_thread": False} if url.startswith("sqlite") else {})
 SessionLocal = sessionmaker(bind=engine)
 MAX_REPORTS = int(os.getenv("MAX_REPORTS", "2000"))
+# Shared by all visitors. Database-backed checks survive application restarts.
+SUBMISSION_WINDOW = timedelta(minutes=10)
+SUBMISSION_LIMIT = 30
+DUPLICATE_WINDOW = timedelta(minutes=15)
 
 
 class Base(DeclarativeBase):
@@ -58,6 +64,11 @@ class ReportInput(BaseModel):
     longitude: float = Field(ge=-180, le=180, allow_inf_nan=False)
 
 
+class ReportSubmission(ReportInput):
+    # Optional for compatibility with the existing frontend during rollout.
+    website: str = Field(default="", max_length=200)
+
+
 class ReportOutput(ReportInput):
     model_config = ConfigDict(from_attributes=True)
     id: int
@@ -90,6 +101,7 @@ async def lifespan(app):
 
 
 app = FastAPI(title="DrainWatch", version="0.1.0", lifespan=lifespan)
+app.add_middleware(ReportBodyLimit)
 app.add_middleware(CORSMiddleware,
     allow_origins=[x.strip() for x in os.getenv("CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(",") if x.strip()],
     allow_methods=["GET", "POST"], allow_headers=["Content-Type"])
@@ -102,15 +114,34 @@ def health(db: Session = Depends(get_db)):
 
 
 @app.post("/reports", response_model=ReportOutput, status_code=201)
-def create_report(data: ReportInput, db: Session = Depends(get_db)):
-    # Atomic counter: concurrent requests cannot bypass the record budget.
+def create_report(data: ReportSubmission, db: Session = Depends(get_db)):
+    if data.website:
+        raise HTTPException(400, "The submission could not be accepted. Please reload the form and try again.")
+    # This update locks the shared budget row until commit/rollback, serializing
+    # submission checks on PostgreSQL (READ COMMITTED) and SQLite. No IP headers
+    # are trusted, stored or needed. Rejected submissions roll back the counter.
     reserved = db.execute(update(Budget).where(Budget.id == 1, Budget.used < MAX_REPORTS)
                           .values(used=Budget.used + 1))
     if reserved.rowcount != 1:
         db.rollback()
         raise HTTPException(409, "The demo report limit has been reached. Existing reports remain available.")
+    now = datetime.now(timezone.utc)
+    recent = db.scalars(select(Report).where(Report.created_at >= now - DUPLICATE_WINDOW)).all()
+    fingerprint = report_fingerprint(data)
+    if any(report_fingerprint(row) == fingerprint for row in recent):
+        db.rollback()
+        raise HTTPException(409, "An identical report was already submitted in the last 15 minutes. Check the dashboard before submitting again.")
+    # SQLite returns naive datetimes; these timestamps were written in UTC.
+    timestamps = [row.created_at.replace(tzinfo=timezone.utc) if row.created_at.tzinfo is None
+                  else row.created_at for row in recent]
+    active = sorted(stamp for stamp in timestamps if stamp > now - SUBMISSION_WINDOW)
+    if len(active) >= SUBMISSION_LIMIT:
+        retry_after = max(1, ceil((active[len(active) - SUBMISSION_LIMIT] + SUBMISSION_WINDOW - now).total_seconds()))
+        db.rollback()
+        raise HTTPException(429, f"The demo is receiving many reports. Please try again in {retry_after} seconds. Existing reports remain available.",
+                            headers={"Retry-After": str(retry_after)})
     score, priority = assess(data)
-    report = Report(**data.model_dump(), score=score, priority=priority)
+    report = Report(**data.model_dump(exclude={"website"}), score=score, priority=priority, created_at=now)
     db.add(report)
     db.commit()
     db.refresh(report)
