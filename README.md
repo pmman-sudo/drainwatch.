@@ -10,7 +10,7 @@ DrainWatch is a community drainage reporting and planning prototype. It turns ob
 
 A drainage observation becomes more useful when reviewers can locate it, understand the reported conditions, and compare it with other observations. DrainWatch brings those steps into one workflow, designed to support community reporting and local maintenance review.
 
-The **Cleanup Planning Lab** extends reporting with a practical question: *what would the review scores look like if blockage were removed at a limited number of reported sites?* Users can compare an illustrative scenario and export a brief without changing the saved observations.
+The **Cleanup Planning Lab** asks: *which reported sites fit a limited effort budget, and what changes when the selection strategy changes?* Users assign illustrative effort estimates, compare highest-priority-first selection with a combination that maximizes removable blockage points, and export both plans without changing saved observations.
 
 > DrainWatch uses transparent rules. Scores are review priorities, not flood probabilities. Reports are unverified, and scenario score changes are not measured reductions in flooding or estimates of people protected.
 
@@ -22,7 +22,7 @@ The **Cleanup Planning Lab** extends reporting with a practical question: *what 
 | Dashboard | Shows aggregate counts and the latest 100 reports, with High, Medium, and Low priority filters. |
 | Interactive map | Displays priority-colored report markers, report inspection, filters, and a fit-to-reports control. The street background can be switched off. |
 | Explainable scoring | Calculates a reproducible score from three reported conditions. |
-| Cleanup Planning Lab | Compares hypothetical blockage removal for up to 10 candidate sites and exports a plain-text scenario brief. |
+| Cleanup Planning Lab | Compares two strategies under a 1–30 unit budget, with editable estimates, selection explanations, a fictional example, and an exported comparison brief. |
 | Persistent storage | Uses PostgreSQL in the deployed service and SQLite by default for local development. |
 | Submission safeguards | Applies duplicate detection, a shared submission limit, a hidden bot-trap field, request-size limits, and input validation. |
 | Deployment workflow | Connects the GitHub main branch to Vercel and Northflank for automatic builds and deployment. |
@@ -49,13 +49,20 @@ Blockage contributes one of the first three values. The total ranges from **0 to
 
 For example, full blockage with standing water and nearby buildings scores **100 — High**. These are prototype rules, not a scientifically calibrated flood-risk model.
 
-### Planning assumptions
+### Planning strategies and assumptions
 
-The Planning Lab uses the latest 100 loaded reports with partial or full blockage. It ranks candidates by removable blockage points, then total score, then report ID. The capacity slider selects between 1 and 10 reports, subject to available candidates.
+The Planning Lab considers the latest 100 loaded reports with partial or full blockage. Each saved report starts with an illustrative estimate of **2 effort units**, editable from **1 to 10**. These defaults are not inferred from severity or measured work. The shared budget ranges from **1 to 30 units**.
 
-Each scenario assumes that every report represents a distinct site, each site requires equal effort, and its blockage is completely removed. Standing-water and nearby-building flags remain unchanged. A report scoring **100** therefore becomes **50** in this hypothetical scenario. Saved reports are never modified.
+- **Highest priority first:** considers reports in descending original-score order and takes each one that fits the remaining budget. Ties use larger blockage contribution, then report ID.
+- **Largest score decrease:** uses exact 0/1 knapsack selection to maximize total removable blockage points within the same budget. Ties favor higher combined original score, lower effort, then report IDs. Each report can be selected only once.
 
-Travel time, cost, rainfall, drainage connectivity, and verified cleanup outcomes are not modeled. Reports describing the same physical site are not yet grouped.
+The comparison shows selected reports, effort used and unused, illustrative score decrease, and the number of high-priority reports selected. A larger decrease does not establish a safer or more urgent real-world plan.
+
+**Try fictional example** loads five clearly labeled observations in the browser. At a budget of four units, Strategy A selects one High report for a 50-point decrease; Strategy B selects three lower-priority reports for a 75-point decrease. The example never creates public reports. Changing Junction A's effort estimate from four to one makes both strategies reach 125 points with four selected reports.
+
+Each scenario assumes every report represents a distinct site and its blockage is completely removed. Standing-water and nearby-building flags remain unchanged. A report scoring **100** therefore becomes **50** in this hypothetical scenario. Saved reports are never modified. Scenario estimates reset when leaving the Planning Lab or reloading.
+
+Travel time, actual work costs, rainfall, drainage connectivity, and verified outcomes are not modeled. Reports describing the same physical site are not yet grouped. See [PLANNING_UPGRADE.md](PLANNING_UPGRADE.md) for the comparison model and verification guide.
 
 ## Architecture
 
@@ -151,8 +158,9 @@ Use clearly labeled fictional observations for demonstrations. Existing shared-d
 1. Submit a report named **DEMO — Test Junction A**, using coordinates `6.3350, 5.6037` and a description explicitly stating that it is fictional.
 2. Select **Full** blockage, standing water, and nearby buildings. Expect **100 — High**.
 3. Refresh the dashboard and inspect the report on the map. Try the priority filters.
-4. Open the Planning Lab and compare the report's hypothetical **100 → 50** score change.
-5. Download the scenario brief and inspect its assumptions and suggested verification step.
+4. Open the Planning Lab, adjust effort estimates and the shared budget, and compare both plans.
+5. Select **Try fictional example** at four units to see **50 versus 75** illustrative points.
+6. Download the comparison brief and inspect both plans, all estimates, and assumptions.
 
 For a duplicate check, repeat a newly accepted fictional report with identical values within 15 minutes. Expect a duplicate warning and no additional saved report. Run rate-limit and concurrency tests locally rather than filling the shared demo's submission allowance.
 
@@ -195,6 +203,16 @@ npm.cmd run build
 
 Manual checks on the deployed app demonstrated report submission and retrieval, dashboard and map filtering, scenario comparison and brief download, and rejection of an identical repeat submission. Automated PostgreSQL integration tests and a complete mobile/browser compatibility pass remain outstanding. A successful build alone does not verify those behaviors.
 
+### Planner checks
+
+From the repository root (Node.js built-in test runner; no additional dependencies):
+
+```powershell
+node --test frontend/tests/planning.test.js
+```
+
+The planner has ten passing tests, including agreement with exhaustive subset search across 780 fixture/budget combinations, deterministic ties, invalid estimates, empty plans, 100-report input, unchanged source data, and comparison-brief content. The frontend production build also passed after this upgrade. The upgrade must still be installed and deployed before its behavior can be confirmed on the live site.
+
 ## API overview
 
 | Method | Endpoint | Purpose |
@@ -216,7 +234,11 @@ Report listing defaults to 50 results and permits up to 100 per request. The fro
 | `backend/Dockerfile` | API container image. |
 | `frontend/src/main.jsx` | Application navigation, dashboard, and submission form. |
 | `frontend/src/ReportMap.jsx` | Interactive map and report inspection. |
-| `frontend/src/Planner.jsx` | Scenario ranking, comparisons, and brief export. |
+| `frontend/src/Planner.jsx` | Budget controls, effort estimates, and strategy comparison. |
+| `frontend/src/planning.js` | Selection algorithms, fictional fixtures, explanations, and comparison export. |
+| `frontend/src/planner.css` | Scoped planner styling. |
+| `frontend/tests/planning.test.js` | Planner correctness and regression tests. |
+| `PLANNING_UPGRADE.md` | Planner assumptions, test coverage, and demo walkthrough. |
 | `frontend/src/style.css` | Responsive styling. |
 | `SPAM_PROTECTION.md` | Submission protection design and verification guide. |
 
@@ -226,7 +248,7 @@ Report listing defaults to 50 results and permits up to 100 per request. The fro
 - Add moderation, report verification, and resolution tracking.
 - Expand PostgreSQL integration tests and mobile/accessibility validation.
 - Introduce stronger submission verification and traffic controls for broader public use.
-- Refine planning with verified data, effort estimates, and maintenance-team feedback.
+- Calibrate illustrative effort estimates and scoring with verified data and maintenance-team feedback.
 
 ## Author and acknowledgements
 
